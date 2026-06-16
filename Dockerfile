@@ -1,13 +1,30 @@
-FROM python:3.11-slim
+# Alpaca
+ALPACA_API_KEY=your_alpaca_key
+ALPACA_SECRET_KEY=your_alpaca_secret
+ALPACA_PAPER=true
+ALPACA_DATA_FEED=iex
 
-WORKDIR /app
+# Google Sheets
+GOOGLE_SHEET_ID=your_google_sheet_id
+GOOGLE_WORKSHEET_NAME=Screener
 
-ENV PYTHONDONTWRITEBYTECODE=1
-ENV PYTHONUNBUFFERED=1
+# Put the full service account JSON here, or base64 encode it and put that here.
+GOOGLE_SERVICE_ACCOUNT_JSON={"type":"service_account","project_id":"..."}
 
-COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
+# Runtime tuning
+BATCH_SIZE=100
+LOOKBACK_DAYS=430
+REQUEST_TIMEOUT_SECONDS=10
+REQUEST_RETRIES=5
+REQUEST_SLEEP_SECONDS=0.75
+RATE_LIMIT_SLEEP_SECONDS=20
+ERROR_SLEEP_SECONDS=30
+MARKET_CLOSED_SLEEP_SECONDS=60
+SUCCESS_SLEEP_SECONDS=30
+SHEET_CLEAR_MAX_ROWS=20000
+MIN_CHUNK_SUCCESS_RATIO=0.90
 
-COPY main.py .
-
-CMD ["sh", "-c", "uvicorn main:app --host 0.0.0.0 --port ${PORT:-8000}"]
+# Development override
+# false = blank the sheet when market is closed
+# true = pull the latest available daily data even when market is closed
+ALLOW_OFF_HOURS_DATA_PULL=false
