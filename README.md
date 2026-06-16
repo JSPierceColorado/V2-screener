@@ -2,19 +2,28 @@
 
 Minimal perpetual screener for Alpaca tradable US equities.
 
-It writes these columns to Google Sheets:
+It writes only these screener-owned columns to Google Sheets:
 
 ```text
-symbol, close, sma_200, sma_50, pos_52w, dollar_vol_m
+A: symbol
+B: close
+C: sma_200
+D: sma_50
+E: pos_52w
+F: dollar_vol_m
 ```
+
+Column G is intentionally never written, cleared, or deleted by the bot. It is reserved for your Google Sheets scoring formula / downstream buy logic.
 
 Behavior:
 
 - Checks Alpaca market clock before each run.
-- If the market is closed, clears the Screener tab so downstream systems see a blank sheet.
+- If the market is closed, clears only columns A:F so downstream systems see a blank screener while column G formulas survive.
 - Set `ALLOW_OFF_HOURS_DATA_PULL=true` to populate the sheet during off-hours for development/programming work.
 - If the market is open, leaves the old sheet data visible while it builds the next full screener.
-- After a successful full run, updates the sheet.
+- Excludes symbols only when `close` or `dollar_vol_m` is blank, missing, non-numeric, or zero.
+- For recent IPOs/new listings, `sma_50`, `sma_200`, and `pos_52w` use whatever valid history is available instead of requiring full 50/200/252-day windows.
+- After a successful full run, updates only columns A:F.
 - If a run fails badly, it does not overwrite the prior sheet.
 - Runs continuously on Railway.
 
@@ -56,3 +65,38 @@ ALLOW_OFF_HOURS_DATA_PULL=true
 ```
 
 When this is enabled, the bot still checks the Alpaca clock and records `market_open` in `/healthz`, but it does not let a closed market prevent a screener run. If the clock request itself fails, the bot will still attempt the screener run instead of clearing the sheet.
+
+
+## Row filtering and recent IPOs
+
+The screener skips a symbol only when one of the hard execution/liquidity fields is missing or unusable:
+
+```text
+close <= 0 or blank
+dollar_vol_m <= 0 or blank
+```
+
+Recent IPOs and new listings are still included when they have valid close and dollar-volume data. For those symbols, the history-based columns are computed from whatever valid daily bars exist:
+
+```text
+sma_50   = average of up to the latest 50 available closes
+sma_200  = average of up to the latest 200 available closes
+pos_52w  = position within up to the latest 252 available bars
+```
+
+If the available high/low range for `pos_52w` is zero, the screener writes a neutral `0.5` rather than leaving the cell blank.
+
+
+## Column ownership
+
+The screener owns only columns A:F. Column G is reserved for your Sheet formula score.
+
+Important implementation detail:
+
+```text
+Market closed clear: A1:F{SHEET_CLEAR_MAX_ROWS}
+Fresh screener write: A1:F{last_row}
+Old-row cleanup: A{first_old_row}:F{SHEET_CLEAR_MAX_ROWS}
+```
+
+The bot also avoids resizing the worksheet down to six columns, because that could delete column G. New worksheets are created with at least seven columns.

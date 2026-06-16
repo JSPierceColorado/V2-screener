@@ -22,6 +22,7 @@ from google.oauth2.service_account import Credentials
 
 SHEET_SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
 HEADERS = ["symbol", "close", "sma_200", "sma_50", "pos_52w", "dollar_vol_m"]
+FORMULA_SAFE_COLUMN_COUNT = 7  # Keep column G available for sheet-owned scoring formulas.
 
 
 def env_bool(name: str, default: bool) -> bool:
@@ -170,7 +171,7 @@ def worksheet(gc: gspread.Client, cfg: Config) -> gspread.Worksheet:
     try:
         return spreadsheet.worksheet(cfg.worksheet_name)
     except gspread.WorksheetNotFound:
-        return spreadsheet.add_worksheet(title=cfg.worksheet_name, rows=1000, cols=len(HEADERS))
+        return spreadsheet.add_worksheet(title=cfg.worksheet_name, rows=1000, cols=FORMULA_SAFE_COLUMN_COUNT)
 
 
 # -----------------------------
@@ -302,7 +303,7 @@ def rounded(value: Optional[float], digits: int) -> Any:
     return round(value, digits)
 
 
-def row_for_symbol(symbol: str, bars: List[Dict[str, Any]]) -> List[Any]:
+def row_for_symbol(symbol: str, bars: List[Dict[str, Any]]) -> Optional[List[Any]]:
     clean = []
     for bar in bars:
         close = as_float(bar.get("c"))
@@ -316,26 +317,33 @@ def row_for_symbol(symbol: str, bars: List[Dict[str, Any]]) -> List[Any]:
         clean.append({"close": close, "high": high, "low": low, "volume": volume})
 
     if not clean:
-        return [symbol, "", "", "", "", ""]
+        return None
 
     closes = [b["close"] for b in clean]
     latest = clean[-1]
     close = latest["close"]
 
-    sma_50 = mean(closes[-50:]) if len(closes) >= 50 else None
-    sma_200 = mean(closes[-200:]) if len(closes) >= 200 else None
+    # For recent IPOs/new listings, use whatever valid history exists instead
+    # of requiring a full 50/200 trading-day window. Example: if a symbol has
+    # 17 bars, both SMA columns use those 17 closes.
+    sma_50 = mean(closes[-50:])
+    sma_200 = mean(closes[-200:])
 
+    # Same idea for the 52-week position: use the available history up to 252
+    # trading days. If the observed high/low range is zero, use a neutral 0.5
+    # rather than leaving the cell blank for brand-new/flat-history symbols.
     window_52w = clean[-252:]
     high_52w = max(b["high"] for b in window_52w)
     low_52w = min(b["low"] for b in window_52w)
-    pos_52w = None
     if high_52w > low_52w:
         pos_52w = (close - low_52w) / (high_52w - low_52w)
         pos_52w = max(0.0, min(1.0, pos_52w))
+    else:
+        pos_52w = 0.5
 
     dollar_vol_m = close * latest["volume"] / 1_000_000.0
 
-    return [
+    row = [
         symbol,
         rounded(close, 4),
         rounded(sma_200, 4),
@@ -344,16 +352,43 @@ def row_for_symbol(symbol: str, bars: List[Dict[str, Any]]) -> List[Any]:
         rounded(dollar_vol_m, 2),
     ]
 
+    # Inclusion filter: only close and dollar volume are hard requirements.
+    # Recent IPOs can have less than 50/200/252 bars, so SMA and pos_52w are
+    # computed from available history and are not used to exclude the symbol.
+    close_value = as_float(row[1])
+    dollar_vol_value = as_float(row[5])
+    if close_value is None or close_value <= 0:
+        return None
+    if dollar_vol_value is None or dollar_vol_value <= 0:
+        return None
+
+    return row
+
 
 # -----------------------------
 # Sheets
 # -----------------------------
 
 
+def ensure_sheet_size_for_screener(ws: gspread.Worksheet, needed_rows: int) -> None:
+    """Resize only when necessary, and never shrink/delete column G.
+
+    The screener owns columns A:F. Column G is intentionally reserved for
+    Google Sheets formulas used by downstream bots. A prior implementation
+    resized the sheet to exactly six columns, which could remove column G.
+    """
+    target_rows = max(needed_rows, ws.row_count)
+    target_cols = max(ws.col_count, FORMULA_SAFE_COLUMN_COUNT)
+
+    if ws.row_count < needed_rows or ws.col_count < FORMULA_SAFE_COLUMN_COUNT:
+        ws.resize(rows=target_rows, cols=target_cols)
+
+
 def clear_screener_sheet(gc: gspread.Client, cfg: Config) -> None:
     ws = worksheet(gc, cfg)
-    ws.clear()
-    log.info("Screener sheet cleared because market is closed")
+    ensure_sheet_size_for_screener(ws, cfg.sheet_clear_max_rows)
+    ws.batch_clear([f"A1:F{cfg.sheet_clear_max_rows}"])
+    log.info("Screener columns A:F cleared because market is closed; column G preserved")
 
 
 def write_screener_sheet(gc: gspread.Client, cfg: Config, rows: List[List[Any]]) -> None:
@@ -361,18 +396,18 @@ def write_screener_sheet(gc: gspread.Client, cfg: Config, rows: List[List[Any]])
     values = [HEADERS] + rows
 
     needed_rows = max(len(values) + 10, 1000)
-    if ws.row_count < needed_rows or ws.col_count < len(HEADERS):
-        ws.resize(rows=needed_rows, cols=len(HEADERS))
+    ensure_sheet_size_for_screener(ws, needed_rows)
 
+    # Update only A:F. Column G is reserved for sheet-owned scoring formulas.
     # Update first, then clear extra old rows below. This keeps the prior screener visible
     # while the new run is being computed.
-    ws.update(range_name="A1", values=values, value_input_option="RAW")
+    ws.update(range_name="A1:F" + str(len(values)), values=values, value_input_option="RAW")
 
     clear_start = len(values) + 1
     if clear_start <= cfg.sheet_clear_max_rows:
         ws.batch_clear([f"A{clear_start}:F{cfg.sheet_clear_max_rows}"])
 
-    log.info("Wrote %s screener rows", len(rows))
+    log.info("Wrote %s screener rows to columns A:F; column G preserved", len(rows))
 
 
 # -----------------------------
@@ -384,20 +419,33 @@ def build_screener_rows(session: requests.Session, cfg: Config) -> List[List[Any
     symbols = get_tradable_symbols(session, cfg)
     log.info("Found %s active tradable Alpaca US equity symbols", len(symbols))
 
-    rows_by_symbol: Dict[str, List[Any]] = {symbol: [symbol, "", "", "", "", ""] for symbol in symbols}
+    rows_by_symbol: Dict[str, List[Any]] = {}
     total_chunks = 0
     successful_chunks = 0
+    skipped_invalid_price_or_volume = 0
 
     for chunk in chunks(symbols, cfg.batch_size):
         total_chunks += 1
         try:
             bars_by_symbol = fetch_daily_bars_for_chunk(session, cfg, chunk)
+            chunk_kept = 0
             for symbol in chunk:
-                rows_by_symbol[symbol] = row_for_symbol(symbol, bars_by_symbol.get(symbol, []))
+                row = row_for_symbol(symbol, bars_by_symbol.get(symbol, []))
+                if row is None:
+                    skipped_invalid_price_or_volume += 1
+                    continue
+                rows_by_symbol[symbol] = row
+                chunk_kept += 1
             successful_chunks += 1
-            log.info("Processed chunk %s symbols=%s success", total_chunks, len(chunk))
+            log.info(
+                "Processed chunk %s symbols=%s kept=%s skipped_invalid_price_or_volume=%s success",
+                total_chunks,
+                len(chunk),
+                chunk_kept,
+                len(chunk) - chunk_kept,
+            )
         except Exception as exc:  # noqa: BLE001 - continue so one chunk does not kill process
-            log.exception("Chunk failed; keeping blank metrics for this chunk. first_symbol=%s err=%s", chunk[0], exc)
+            log.exception("Chunk failed; skipping this chunk. first_symbol=%s err=%s", chunk[0], exc)
 
     if total_chunks == 0:
         raise RuntimeError("No symbol chunks were created")
@@ -409,7 +457,13 @@ def build_screener_rows(session: requests.Session, cfg: Config) -> List[List[Any
             f"({success_ratio:.1%}); refusing to overwrite sheet"
         )
 
-    return [rows_by_symbol[symbol] for symbol in symbols]
+    rows = [rows_by_symbol[symbol] for symbol in symbols if symbol in rows_by_symbol]
+    log.info(
+        "Built %s screener rows; skipped %s symbols with blank/zero close or dollar_vol_m",
+        len(rows),
+        skipped_invalid_price_or_volume,
+    )
+    return rows
 
 
 def screener_loop() -> None:
