@@ -71,7 +71,6 @@ class Config:
     market_closed_sleep_seconds: int
     success_sleep_seconds: float
     sheet_clear_max_rows: int
-    min_chunk_success_ratio: float
     allow_off_hours_data_pull: bool
 
     @property
@@ -103,7 +102,6 @@ def load_config() -> Config:
         market_closed_sleep_seconds=env_int("MARKET_CLOSED_SLEEP_SECONDS", 60),
         success_sleep_seconds=env_float("SUCCESS_SLEEP_SECONDS", 60.0),
         sheet_clear_max_rows=env_int("SHEET_CLEAR_MAX_ROWS", 20000),
-        min_chunk_success_ratio=env_float("MIN_CHUNK_SUCCESS_RATIO", 0.90),
         allow_off_hours_data_pull=env_bool("ALLOW_OFF_HOURS_DATA_PULL", False),
     )
 
@@ -456,6 +454,8 @@ def build_screener_rows(session: requests.Session, cfg: Config) -> List[List[Any
     rows_by_symbol: Dict[str, List[Any]] = {}
     total_chunks = 0
     successful_chunks = 0
+    failed_chunks = 0
+    failed_chunk_symbols = 0
     skipped_invalid_price_or_volume = 0
 
     for chunk in chunks(symbols, cfg.batch_size):
@@ -479,22 +479,26 @@ def build_screener_rows(session: requests.Session, cfg: Config) -> List[List[Any
                 len(chunk) - chunk_kept,
             )
         except Exception as exc:  # noqa: BLE001 - continue so one chunk does not kill process
-            log.exception("Chunk failed; skipping this chunk. first_symbol=%s err=%s", chunk[0], exc)
+            failed_chunks += 1
+            failed_chunk_symbols += len(chunk)
+            log.exception(
+                "Chunk failed after retries; omitting this chunk from current refresh. first_symbol=%s symbols=%s err=%s",
+                chunk[0],
+                len(chunk),
+                exc,
+            )
 
     if total_chunks == 0:
-        raise RuntimeError("No symbol chunks were created")
-
-    success_ratio = successful_chunks / total_chunks
-    if success_ratio < cfg.min_chunk_success_ratio:
-        raise RuntimeError(
-            f"Only {successful_chunks}/{total_chunks} chunks succeeded "
-            f"({success_ratio:.1%}); refusing to overwrite sheet"
-        )
+        log.warning("No symbol chunks were created; writing an empty screener refresh")
 
     rows = [rows_by_symbol[symbol] for symbol in symbols if symbol in rows_by_symbol]
     log.info(
-        "Built %s screener rows; skipped %s symbols with blank/zero close or dollar_vol_m",
+        "Built %s screener rows from successful chunks=%s/%s; omitted_failed_chunks=%s omitted_failed_chunk_symbols=%s; skipped %s symbols with blank/zero close or dollar_vol_m",
         len(rows),
+        successful_chunks,
+        total_chunks,
+        failed_chunks,
+        failed_chunk_symbols,
         skipped_invalid_price_or_volume,
     )
     return rows
@@ -508,7 +512,7 @@ def screener_loop() -> None:
 
     set_status(started=True, allow_off_hours_data_pull=cfg.allow_off_hours_data_pull)
     log.info(
-        "Screener service started request_sleep_seconds=%s rate_limit_sleep_seconds=%s request_retries=%s",
+        "Screener service started request_sleep_seconds=%s rate_limit_sleep_seconds=%s request_retries=%s partial_refresh_mode=true",
         cfg.request_sleep_seconds,
         cfg.rate_limit_sleep_seconds,
         cfg.request_retries,

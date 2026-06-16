@@ -23,8 +23,9 @@ Behavior:
 - If the market is open, leaves the old sheet data visible while it builds the next full screener.
 - Excludes symbols only when `close` or `dollar_vol_m` is blank, missing, non-numeric, or zero.
 - For recent IPOs/new listings, `sma_50`, `sma_200`, and `pos_52w` use whatever valid history is available instead of requiring full 50/200/252-day windows.
-- After a successful full run, updates only columns A:F.
-- If a run fails badly, it does not overwrite the prior sheet.
+- After each run, updates only columns A:F with whatever chunks completed successfully.
+- If one or more chunks fail after retries, those symbols are omitted from that refresh instead of blocking the whole Sheet update.
+- A later refresh can include previously omitted symbols once their chunks succeed.
 - Slows requests slightly and backs off harder on Alpaca 429 rate-limit responses.
 - Runs continuously on Railway.
 
@@ -50,6 +51,27 @@ Health endpoint:
 ```text
 /healthz
 ```
+
+## Partial refresh behavior
+
+This version intentionally does not use a minimum chunk success cutoff. The screener writes whatever valid rows it successfully pulled during the current run.
+
+That means:
+
+```text
+chunk succeeds
+  -> valid symbols from that chunk are written
+
+chunk fails after retries
+  -> symbols from that chunk are omitted from this refresh
+  -> they can reappear on a later refresh
+
+old rows below the new result set
+  -> cleared from A:F only
+  -> column G formulas are preserved
+```
+
+This avoids keeping stale A:F screener values just because one chunk timed out. Missing/failed symbols are safer than stale symbols for downstream buying logic.
 
 ## Rate-limit tuning
 
@@ -122,7 +144,7 @@ The bot also avoids resizing the worksheet down to six columns, because that cou
 On startup, the logs should include a line like:
 
 ```text
-Screener service started request_sleep_seconds=1.25 rate_limit_sleep_seconds=30 request_retries=5
+Screener service started request_sleep_seconds=1.25 rate_limit_sleep_seconds=30 request_retries=5 partial_refresh_mode=true
 ```
 
 If you still see `retrying in 2s` for Alpaca `429` responses, Railway is running an older build. This version should log `GET rate limited ... retrying in 30s` or use Alpaca's `Retry-After` header when present.
