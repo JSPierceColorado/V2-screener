@@ -12,6 +12,7 @@ Behavior:
 
 - Checks Alpaca market clock before each run.
 - If the market is closed, clears the Screener tab so downstream systems see a blank sheet.
+- Set `ALLOW_OFF_HOURS_DATA_PULL=true` to populate the sheet during off-hours for development/programming work.
 - If the market is open, leaves the old sheet data visible while it builds the next full screener.
 - After a successful full run, updates the sheet.
 - If a run fails badly, it does not overwrite the prior sheet.
@@ -39,3 +40,19 @@ Health endpoint:
 ```text
 /healthz
 ```
+
+## Off-hours development mode
+
+By default, the screener blanks the sheet when Alpaca says the market is closed:
+
+```text
+ALLOW_OFF_HOURS_DATA_PULL=false
+```
+
+For development, set this in Railway to keep pulling the latest available daily bars even after hours:
+
+```text
+ALLOW_OFF_HOURS_DATA_PULL=true
+```
+
+When this is enabled, the bot still checks the Alpaca clock and records `market_open` in `/healthz`, but it does not let a closed market prevent a screener run. If the clock request itself fails, the bot will still attempt the screener run instead of clearing the sheet.

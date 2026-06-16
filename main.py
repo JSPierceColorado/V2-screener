@@ -69,6 +69,7 @@ class Config:
     success_sleep_seconds: float
     sheet_clear_max_rows: int
     min_chunk_success_ratio: float
+    allow_off_hours_data_pull: bool
 
     @property
     def trading_base_url(self) -> str:
@@ -91,13 +92,14 @@ def load_config() -> Config:
         worksheet_name=os.getenv("GOOGLE_WORKSHEET_NAME", "Screener"),
         batch_size=env_int("BATCH_SIZE", 100),
         lookback_days=env_int("LOOKBACK_DAYS", 430),
-        request_timeout_seconds=env_int("REQUEST_TIMEOUT_SECONDS", 30),
+        request_timeout_seconds=env_int("REQUEST_TIMEOUT_SECONDS", 10),
         request_retries=env_int("REQUEST_RETRIES", 3),
         error_sleep_seconds=env_int("ERROR_SLEEP_SECONDS", 30),
         market_closed_sleep_seconds=env_int("MARKET_CLOSED_SLEEP_SECONDS", 60),
         success_sleep_seconds=env_float("SUCCESS_SLEEP_SECONDS", 0.0),
         sheet_clear_max_rows=env_int("SHEET_CLEAR_MAX_ROWS", 20000),
         min_chunk_success_ratio=env_float("MIN_CHUNK_SUCCESS_RATIO", 0.90),
+        allow_off_hours_data_pull=env_bool("ALLOW_OFF_HOURS_DATA_PULL", False),
     )
 
 
@@ -120,6 +122,7 @@ STATUS: Dict[str, Any] = {
     "last_success_at": None,
     "last_error": None,
     "rows_written": 0,
+    "allow_off_hours_data_pull": None,
 }
 
 
@@ -415,22 +418,47 @@ def screener_loop() -> None:
     gc = google_client()
     closed_sheet_already_blank = False
 
-    set_status(started=True)
+    set_status(started=True, allow_off_hours_data_pull=cfg.allow_off_hours_data_pull)
     log.info("Screener service started")
 
     while True:
         try:
             set_status(last_error=None)
-            is_open = market_is_open(session, cfg)
-            set_status(market_open=is_open)
 
-            if not is_open:
+            try:
+                is_open = market_is_open(session, cfg)
+                set_status(market_open=is_open)
+            except Exception as exc:  # noqa: BLE001 - fail safe if Alpaca clock is unavailable
+                if cfg.allow_off_hours_data_pull:
+                    log.exception(
+                        "Market clock check failed, but ALLOW_OFF_HOURS_DATA_PULL=true; attempting screener run anyway. err=%s",
+                        exc,
+                    )
+                    set_status(market_open=None, last_error=f"market clock check failed; continuing because override is enabled: {exc}")
+                    is_open = True
+                else:
+                    log.exception(
+                        "Market clock check failed; treating market as closed and clearing screener. err=%s",
+                        exc,
+                    )
+                    set_status(market_open=None, last_error=f"market clock check failed: {exc}")
+                    if not closed_sheet_already_blank:
+                        clear_screener_sheet(gc, cfg)
+                        closed_sheet_already_blank = True
+                        set_status(rows_written=0)
+                    time.sleep(cfg.error_sleep_seconds)
+                    continue
+
+            if not is_open and not cfg.allow_off_hours_data_pull:
                 if not closed_sheet_already_blank:
                     clear_screener_sheet(gc, cfg)
                     closed_sheet_already_blank = True
                     set_status(rows_written=0)
                 time.sleep(cfg.market_closed_sleep_seconds)
                 continue
+
+            if not is_open and cfg.allow_off_hours_data_pull:
+                log.info("Market is closed, but ALLOW_OFF_HOURS_DATA_PULL=true; pulling screener data anyway")
 
             closed_sheet_already_blank = False
             started_at = datetime.now(timezone.utc).isoformat()
