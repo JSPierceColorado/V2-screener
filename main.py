@@ -7,6 +7,7 @@ import threading
 import time
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
+from zoneinfo import ZoneInfo
 from statistics import mean
 from typing import Any, Dict, Iterable, List, Optional
 
@@ -72,6 +73,10 @@ class Config:
     success_sleep_seconds: float
     sheet_clear_max_rows: int
     allow_off_hours_data_pull: bool
+    allow_extended_hours_data_pull: bool
+    market_timezone: str
+    extended_hours_start: str
+    extended_hours_end: str
 
     @property
     def trading_base_url(self) -> str:
@@ -103,6 +108,10 @@ def load_config() -> Config:
         success_sleep_seconds=env_float("SUCCESS_SLEEP_SECONDS", 60.0),
         sheet_clear_max_rows=env_int("SHEET_CLEAR_MAX_ROWS", 20000),
         allow_off_hours_data_pull=env_bool("ALLOW_OFF_HOURS_DATA_PULL", False),
+        allow_extended_hours_data_pull=env_bool("ALLOW_EXTENDED_HOURS_DATA_PULL", False),
+        market_timezone=os.getenv("MARKET_TIMEZONE", "America/New_York").strip() or "America/New_York",
+        extended_hours_start=os.getenv("EXTENDED_HOURS_START", "04:00").strip() or "04:00",
+        extended_hours_end=os.getenv("EXTENDED_HOURS_END", "20:00").strip() or "20:00",
     )
 
 
@@ -126,6 +135,9 @@ STATUS: Dict[str, Any] = {
     "last_error": None,
     "rows_written": 0,
     "allow_off_hours_data_pull": None,
+    "allow_extended_hours_data_pull": None,
+    "extended_session_active": None,
+    "trading_session": None,
 }
 
 
@@ -245,6 +257,84 @@ def get_json(
 def market_is_open(session: requests.Session, cfg: Config) -> bool:
     data = get_json(session, f"{cfg.trading_base_url}/v2/clock", cfg)
     return bool(data.get("is_open"))
+
+
+def market_now(cfg: Config) -> datetime:
+    try:
+        tz = ZoneInfo(cfg.market_timezone)
+    except Exception as exc:  # noqa: BLE001 - invalid env var fallback
+        log.warning(
+            "Invalid MARKET_TIMEZONE=%s; falling back to America/New_York. err=%s",
+            cfg.market_timezone,
+            exc,
+        )
+        tz = ZoneInfo("America/New_York")
+    return datetime.now(tz)
+
+
+def hhmm_to_minutes(value: str, env_name: str) -> int:
+    try:
+        hour_raw, minute_raw = value.split(":", 1)
+        hour = int(hour_raw)
+        minute = int(minute_raw)
+    except Exception as exc:  # noqa: BLE001 - normalize below
+        raise RuntimeError(f"{env_name} must be HH:MM, got {value!r}") from exc
+
+    if hour < 0 or hour > 23 or minute < 0 or minute > 59:
+        raise RuntimeError(f"{env_name} must be HH:MM with a valid 24-hour time, got {value!r}")
+
+    return hour * 60 + minute
+
+
+def minutes_since_midnight(dt: datetime) -> int:
+    return dt.hour * 60 + dt.minute
+
+
+def current_time_is_in_extended_window(cfg: Config, now: datetime) -> bool:
+    start_min = hhmm_to_minutes(cfg.extended_hours_start, "EXTENDED_HOURS_START")
+    end_min = hhmm_to_minutes(cfg.extended_hours_end, "EXTENDED_HOURS_END")
+    current_min = minutes_since_midnight(now)
+
+    if start_min == end_min:
+        # Treat identical start/end as disabled rather than always-on.
+        return False
+
+    if start_min < end_min:
+        return start_min <= current_min < end_min
+
+    # Supports windows that cross midnight, if ever configured that way.
+    return current_min >= start_min or current_min < end_min
+
+
+def is_alpaca_trading_day(session: requests.Session, cfg: Config, ymd: str) -> bool:
+    data = get_json(
+        session,
+        f"{cfg.trading_base_url}/v2/calendar",
+        cfg,
+        params={"start": ymd, "end": ymd},
+    )
+    return bool(data)
+
+
+def extended_session_is_active(session: requests.Session, cfg: Config) -> bool:
+    """Return True when the local market time is inside the configured extended window on an Alpaca trading day.
+
+    This is a session gate only. The screener still pulls daily bars; it does not
+    turn the data into live intraday/extended-hours quotes.
+    """
+    if not cfg.allow_extended_hours_data_pull:
+        return False
+
+    now = market_now(cfg)
+    if not current_time_is_in_extended_window(cfg, now):
+        return False
+
+    ymd = now.date().isoformat()
+    try:
+        return is_alpaca_trading_day(session, cfg, ymd)
+    except Exception as exc:  # noqa: BLE001 - if calendar fails, fail closed
+        log.exception("Unable to confirm Alpaca trading day for extended session; treating as closed. err=%s", exc)
+        return False
 
 
 def get_tradable_symbols(session: requests.Session, cfg: Config) -> List[str]:
@@ -510,12 +600,21 @@ def screener_loop() -> None:
     gc = google_client()
     closed_sheet_already_blank = False
 
-    set_status(started=True, allow_off_hours_data_pull=cfg.allow_off_hours_data_pull)
+    set_status(
+        started=True,
+        allow_off_hours_data_pull=cfg.allow_off_hours_data_pull,
+        allow_extended_hours_data_pull=cfg.allow_extended_hours_data_pull,
+    )
     log.info(
-        "Screener service started request_sleep_seconds=%s rate_limit_sleep_seconds=%s request_retries=%s partial_refresh_mode=true",
+        "Screener service started request_sleep_seconds=%s rate_limit_sleep_seconds=%s request_retries=%s partial_refresh_mode=true allow_extended_hours_data_pull=%s extended_window=%s-%s %s allow_off_hours_data_pull=%s",
         cfg.request_sleep_seconds,
         cfg.rate_limit_sleep_seconds,
         cfg.request_retries,
+        cfg.allow_extended_hours_data_pull,
+        cfg.extended_hours_start,
+        cfg.extended_hours_end,
+        cfg.market_timezone,
+        cfg.allow_off_hours_data_pull,
     )
 
     while True:
@@ -531,31 +630,61 @@ def screener_loop() -> None:
                         "Market clock check failed, but ALLOW_OFF_HOURS_DATA_PULL=true; attempting screener run anyway. err=%s",
                         exc,
                     )
-                    set_status(market_open=None, last_error=f"market clock check failed; continuing because override is enabled: {exc}")
-                    is_open = True
+                    set_status(
+                        market_open=None,
+                        extended_session_active=None,
+                        trading_session="off_hours_override",
+                        last_error=f"market clock check failed; continuing because override is enabled: {exc}",
+                    )
+                    should_pull = True
                 else:
                     log.exception(
                         "Market clock check failed; treating market as closed and clearing screener. err=%s",
                         exc,
                     )
-                    set_status(market_open=None, last_error=f"market clock check failed: {exc}")
+                    set_status(
+                        market_open=None,
+                        extended_session_active=None,
+                        trading_session="closed",
+                        last_error=f"market clock check failed: {exc}",
+                    )
                     if not closed_sheet_already_blank:
                         clear_screener_sheet(gc, cfg)
                         closed_sheet_already_blank = True
                         set_status(rows_written=0)
                     time.sleep(cfg.error_sleep_seconds)
                     continue
+            else:
+                extended_active = False
+                if not is_open and cfg.allow_extended_hours_data_pull:
+                    extended_active = extended_session_is_active(session, cfg)
 
-            if not is_open and not cfg.allow_off_hours_data_pull:
+                set_status(extended_session_active=extended_active)
+
+                if is_open:
+                    should_pull = True
+                    set_status(trading_session="regular")
+                elif extended_active:
+                    should_pull = True
+                    log.info(
+                        "Market is closed, but configured extended-hours window is active; pulling screener data"
+                    )
+                    set_status(trading_session="extended")
+                elif cfg.allow_off_hours_data_pull:
+                    should_pull = True
+                    log.info("Market is closed, but ALLOW_OFF_HOURS_DATA_PULL=true; pulling screener data anyway")
+                    set_status(trading_session="off_hours_override")
+                else:
+                    should_pull = False
+                    set_status(trading_session="closed")
+
+            if not should_pull:
                 if not closed_sheet_already_blank:
                     clear_screener_sheet(gc, cfg)
                     closed_sheet_already_blank = True
                     set_status(rows_written=0)
                 time.sleep(cfg.market_closed_sleep_seconds)
                 continue
-
-            if not is_open and cfg.allow_off_hours_data_pull:
-                log.info("Market is closed, but ALLOW_OFF_HOURS_DATA_PULL=true; pulling screener data anyway")
 
             closed_sheet_already_blank = False
             started_at = datetime.now(timezone.utc).isoformat()

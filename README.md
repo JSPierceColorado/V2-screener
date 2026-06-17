@@ -1,150 +1,47 @@
-# Alpaca Screener
+# Alpaca Screener Bot - Extended Session Gate Patch
 
-Minimal perpetual screener for Alpaca tradable US equities.
+This is the screener-only repo. It writes only columns A:F and preserves column G for a Google Sheets scoring formula.
 
-It writes only these screener-owned columns to Google Sheets:
+## Output columns
 
-```text
-A: symbol
-B: close
-C: sma_200
-D: sma_50
-E: pos_52w
-F: dollar_vol_m
-```
-
-Column G is intentionally never written, cleared, or deleted by the bot. It is reserved for your Google Sheets scoring formula / downstream buy logic.
-
-Behavior:
-
-- Checks Alpaca market clock before each run.
-- If the market is closed, clears only columns A:F so downstream systems see a blank screener while column G formulas survive.
-- Set `ALLOW_OFF_HOURS_DATA_PULL=true` to populate the sheet during off-hours for development/programming work.
-- If the market is open, leaves the old sheet data visible while it builds the next full screener.
-- Excludes symbols only when `close` or `dollar_vol_m` is blank, missing, non-numeric, or zero.
-- For recent IPOs/new listings, `sma_50`, `sma_200`, and `pos_52w` use whatever valid history is available instead of requiring full 50/200/252-day windows.
-- After each run, updates only columns A:F with whatever chunks completed successfully.
-- If one or more chunks fail after retries, those symbols are omitted from that refresh instead of blocking the whole Sheet update.
-- A later refresh can include previously omitted symbols once their chunks succeed.
-- Slows requests slightly and backs off harder on Alpaca 429 rate-limit responses.
-- Runs continuously on Railway.
-
-## Deploy notes
-
-1. Create a new Google Sheet.
-2. Rename the first tab to `Screener`, or set `GOOGLE_WORKSHEET_NAME` to whatever tab name you want.
-3. Create a Google Cloud service account with Sheets API access.
-4. Create a JSON key for the service account.
-5. Share the Google Sheet with the service account `client_email` as Editor.
-6. Add the environment variables from `.env.example` to Railway.
-7. Deploy this repo to Railway.
-
-## Local run
-
-```bash
-pip install -r requirements.txt
-uvicorn main:app --host 0.0.0.0 --port 8000
-```
-
-Health endpoint:
+A:F are owned by the bot:
 
 ```text
-/healthz
+symbol | close | sma_200 | sma_50 | pos_52w | dollar_vol_m
 ```
 
-## Partial refresh behavior
+Column G is intentionally never written or cleared by the bot.
 
-This version intentionally does not use a minimum chunk success cutoff. The screener writes whatever valid rows it successfully pulled during the current run.
+## Session behavior
 
-That means:
+The bot pulls data when one of these is true:
 
-```text
-chunk succeeds
-  -> valid symbols from that chunk are written
+1. Alpaca regular-market clock says the market is open.
+2. `ALLOW_EXTENDED_HOURS_DATA_PULL=true`, the current New York time is within the configured extended window, and Alpaca calendar confirms today is a trading day.
+3. `ALLOW_OFF_HOURS_DATA_PULL=true`, which is a development override.
 
-chunk fails after retries
-  -> symbols from that chunk are omitted from this refresh
-  -> they can reappear on a later refresh
+If none are true, the bot clears only A:F and preserves G.
 
-old rows below the new result set
-  -> cleared from A:F only
-  -> column G formulas are preserved
-```
+This patch changes when the daily-bar screener runs. It does not change the data type to live quote/intraday data.
 
-This avoids keeping stale A:F screener values just because one chunk timed out. Missing/failed symbols are safer than stale symbols for downstream buying logic.
-
-## Rate-limit tuning
-
-Alpaca may return `429 {"message":"too many requests."}` if the screener pulls too quickly. This repo includes simple throttling knobs:
+## New environment variables
 
 ```text
-REQUEST_SLEEP_SECONDS=0.75      # pause after each successful Alpaca GET
-RATE_LIMIT_SLEEP_SECONDS=20     # base pause when Alpaca returns 429
-REQUEST_RETRIES=5               # retry more patiently
-SUCCESS_SLEEP_SECONDS=30        # pause after a full completed sheet update
-```
-
-If you still see frequent 429s, raise `REQUEST_SLEEP_SECONDS` to `1.0` or `1.5`. If the bot gets a 429, it will wait longer before retrying instead of hammering the same endpoint again immediately.
-
-
-## Off-hours development mode
-
-By default, the screener blanks the sheet when Alpaca says the market is closed:
-
-```text
+ALLOW_EXTENDED_HOURS_DATA_PULL=true
+MARKET_TIMEZONE=America/New_York
+EXTENDED_HOURS_START=04:00
+EXTENDED_HOURS_END=20:00
 ALLOW_OFF_HOURS_DATA_PULL=false
 ```
 
-For development, set this in Railway to keep pulling the latest available daily bars even after hours:
+`ALLOW_EXTENDED_HOURS_DATA_PULL` defaults to `false` in code. Set it explicitly in Railway when you want the screener populated during extended sessions.
 
-```text
-ALLOW_OFF_HOURS_DATA_PULL=true
-```
+`ALLOW_OFF_HOURS_DATA_PULL` is stronger and should generally be used only for development/testing.
 
-When this is enabled, the bot still checks the Alpaca clock and records `market_open` in `/healthz`, but it does not let a closed market prevent a screener run. If the clock request itself fails, the bot will still attempt the screener run instead of clearing the sheet.
+## Existing important behavior preserved
 
-
-## Row filtering and recent IPOs
-
-The screener skips a symbol only when one of the hard execution/liquidity fields is missing or unusable:
-
-```text
-close <= 0 or blank
-dollar_vol_m <= 0 or blank
-```
-
-Recent IPOs and new listings are still included when they have valid close and dollar-volume data. For those symbols, the history-based columns are computed from whatever valid daily bars exist:
-
-```text
-sma_50   = average of up to the latest 50 available closes
-sma_200  = average of up to the latest 200 available closes
-pos_52w  = position within up to the latest 252 available bars
-```
-
-If the available high/low range for `pos_52w` is zero, the screener writes a neutral `0.5` rather than leaving the cell blank.
-
-
-## Column ownership
-
-The screener owns only columns A:F. Column G is reserved for your Sheet formula score.
-
-Important implementation detail:
-
-```text
-Market closed clear: A1:F{SHEET_CLEAR_MAX_ROWS}
-Fresh screener write: A1:F{last_row}
-Old-row cleanup: A{first_old_row}:F{SHEET_CLEAR_MAX_ROWS}
-```
-
-The bot also avoids resizing the worksheet down to six columns, because that could delete column G. New worksheets are created with at least seven columns.
-
-
-## Rate-limit sanity check
-
-On startup, the logs should include a line like:
-
-```text
-Screener service started request_sleep_seconds=1.25 rate_limit_sleep_seconds=30 request_retries=5 partial_refresh_mode=true
-```
-
-If you still see `retrying in 2s` for Alpaca `429` responses, Railway is running an older build. This version should log `GET rate limited ... retrying in 30s` or use Alpaca's `Retry-After` header when present.
+- Recent IPOs are included if `close` and `dollar_vol_m` are present and greater than zero.
+- `sma_50`, `sma_200`, and `pos_52w` use whatever valid history exists.
+- Failed symbol chunks are omitted from the current refresh; successful chunks still write.
+- Old leftover rows in A:F are cleared after each write.
+- Column G formulas are preserved.
